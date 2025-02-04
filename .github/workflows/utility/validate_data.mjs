@@ -13,11 +13,48 @@
 //
 
 import * as path from 'path';
-import * as chain_reg from './chain_registry_local.mjs';
+import * as chain_reg from './chain_registry.mjs';
 
+const chainRegistryRoot = "../../..";
 
 const chainIdMap = new Map();
 let base_denoms = [];
+
+const deepEqual = (a, b) => {
+  if (a === b) return true; // Primitive values or reference equality
+  if (typeof a !== typeof b || a === null || b === null) return false; // Mismatched types
+  if (typeof a === "object") {
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false; // Different number of keys
+    return keysA.every(key => deepEqual(a[key], b[key])); // Recursive comparison
+  }
+  return false; // Fallback for unhandled cases
+};
+
+function deepEqualWithLoggingOneWay(obj1, obj2, path = '', mismatches = []) {
+  if (typeof obj1 === 'object' && typeof obj2 === 'object' && obj1 !== null && obj2 !== null) {
+    for (const key in obj1) {
+      const newPath = path ? `${path}.${key}` : key;
+
+      if (!(key in obj2)) {
+        mismatches.push({ path: newPath, reason: 'Missing in currentVersion', value1: obj1[key] });
+      } else {
+        deepEqualWithLoggingOneWay(obj1[key], obj2[key], newPath, mismatches);
+      }
+    }
+  } else if (obj1 !== obj2) {
+    mismatches.push({
+      path,
+      reason: 'Value mismatch',
+      value1: obj1,
+      value2: obj2,
+    });
+  }
+
+  return mismatches;
+}
+
 
 
 function checkChainIdConflict(chain_name) {
@@ -33,6 +70,19 @@ function checkChainIdConflict(chain_name) {
     throw new Error(`Duplicate chain ID for ${chain_name} found! Chain ID ${chain_id} is also claimed by ${conflict_chain_name}.`);
   }
   chainIdMap.set(chain_id, chain_name);
+
+}
+
+function checkSlip44(chain_name) {
+
+  let chain_type = chain_reg.getFileProperty(chain_name, "chain", "chain_type");
+  if (!chain_type || chain_type !== "cosmos") { return; }
+  let chain_status = chain_reg.getFileProperty(chain_name, "chain", "status");
+  if (!chain_status || chain_status === "upcoming" || chain_status === "killed") { return; }
+  let slip44 = chain_reg.getFileProperty(chain_name, "chain", "slip44");
+  if (!slip44) {
+    throw new Error(`Chain ${chain_name} missing slip44!`);
+  }
 
 }
 
@@ -172,136 +222,44 @@ function checkImageSyncIsValid(chain_name, asset) {
 
 }
 
-
-function checkVersionsFileAndVersionsArray(chain_name) {
-
-  const versionsFile = chain_reg.getFileProperty(chain_name, "versions", "versions");
-  const versionsArray = chain_reg.getFileProperty(chain_name, "chain", "codebase")?.versions;
-
-  if (versionsFile && versionsArray) {
-    throw new Error(`Invalid versions array detected in chain.json for ${chain_name}. versions.json already used.`);
-  }
-
-}
-
-
-function checkReplacementVersionProperties(chain_name) {
+function compare_CodebaseVersionData_to_VersionsFile(chain_name) {
 
   const codebase = chain_reg.getFileProperty(chain_name, "chain", "codebase");
-  const versions = codebase?.versions;
-
-  if (codebase) {
-    versions?.forEach((version) => {
-      checkVersionForReplacementProperties(chain_name, version);
-    });
-    checkVersionForReplacementProperties(chain_name, codebase);
-  }
-
-}
-
-function checkVersionForReplacementProperties(chain_name, versionObject) {
-
-  const replacementPropertiesMap = new Map([
-    ["cosmos_sdk_version", "sdk"],
-    ["ibc_go_version", "ibc"],
-    ["go_version", "language"],
-    ["cosmwasm_version", "cosmwasm"]
+  if (!codebase) { return; }
+  const codebaseVersionKeys = new Set([
+    "recommended_version",
+    "compatible_versions",
+    "tag",
+    "language",
+    "binaries",
+    "sdk",
+    "consensus",
+    "cosmwasm",
+    "ibc"
   ]);
+  const filteredCodebase = Object.fromEntries(
+    Object.entries(codebase).filter(([key]) => codebaseVersionKeys.has(key))
+  );
 
-  const splitRegexPattern = /^(?:([^ \@]*)[ \@])?(.*)$/;
-  const repoRegexPattern = /(?:.*\/)?([^\/]+\/[^\/]+)$/;
-  const tagRegexPattern = /^(?=.*-).+$/;
-  const versionRegexPattern = /^([^ -]+)/;
+  const versionsArray = chain_reg.getFileProperty(chain_name, "versions", "versions");
+  let currentVersion = versionsArray?.find(
+    (version) => version.recommended_version === codebase?.recommended_version
+  ) || {};
 
-  const name = versionObject.name;
+  const mismatches = deepEqualWithLoggingOneWay(filteredCodebase, currentVersion);
 
-  for (const [deprecated, replacement] of replacementPropertiesMap) {
-
-    const deprecatedValue = versionObject[deprecated];
-    const replacementValue = versionObject[replacement];
-    
-
-    if (deprecatedValue) {
-
-      //replacement must exist
-      if (!replacementValue) {
-        throw new Error(`Missing replacement property (${replacement}) for deprecated proerty (${deprecated}) for: ${chain_name}::${name}`);
-      }
-
-      //split the value into repo, version, and tag, then check that they match
-      let repo = deprecatedValue;
-      repo = repo.match(splitRegexPattern)?.[1];
-      repo = repo?.match(repoRegexPattern)?.[1];
-      if (repo) {
-        repo = "https://github.com/" + repo;
-        if (repo != replacementValue.repo) {
-          throw new Error(`Replacement property (${replacement}.repo) value (${replacementValue.repo}) does not match computed value (${repo}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-      
-      let tag = deprecatedValue;
-      tag = tag.match(splitRegexPattern)?.[2];
-      let version = tag;
-      tag = tag?.match(tagRegexPattern)?.[1];
-      if (tag) {
-        //console.log(tag);
-        if (repo != replacementValue.tag) {
-          throw new Error(`Replacement property (${replacement}.tag) value (${replacementValue.tag}) does not match computed value (${tag}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-
-      version = version?.match(versionRegexPattern)?.[1];
-      if (version) {
-        //console.log(version);
-        if (version != replacementValue.version) {
-          throw new Error(`Replacement property (${replacement}.version) value (${replacementValue.version}) does not match computed value (${version}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-
-      if (deprecated === "ibc_go_version") {
-        const expectedValue = "go";
-        if (!replacementValue.type || (replacementValue.type !== expectedValue)) {
-          throw new Error(`Replacement property (${replacement}.type) value (${replacementValue.type}) does not match expected value (${expectedValue}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-
-      if (deprecated === "go_version") {
-        const expectedValue = "go";
-        if (!replacementValue.type || (replacementValue.type !== expectedValue)) {
-          throw new Error(`Replacement property (${replacement}.type) value (${replacementValue.type}) does not match expected value (${expectedValue}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-
-      if (deprecated === "cosmos_sdk_version") {
-        const expectedValue = "cosmos";
-        if (!replacementValue.type || (replacementValue.type !== expectedValue)) {
-          throw new Error(`Replacement property (${replacement}.type) value (${replacementValue.type}) does not match expected value (${expectedValue}) in deprecated property (${deprecatedValue}) for: ${chain_name}::${name}`);
-        }
-      }
-
-    }
-
-  }
-
-  if (versionObject.cosmwasm_enabled) {
-    if (versionObject.cosmwasm_enabled != versionObject.cosmwasm.enabled) {
-      throw new Error(`Replacement property (versionObject.cosmwasm.enabled) value (${versionObject.cosmwasm.enabled}) does not match deprecated property (versionObject.cosmwasm_enabled) value (${versionObject.cosmwasm_enabled}) for: ${chain_name}::${name}`);
-    }
-  }
-
-  if (versionObject.cosmwasm_path) {
-    if (versionObject.cosmwasm_path != versionObject.cosmwasm.path) {
-      throw new Error(`Replacement property (versionObject.cosmwasm.path) value (${versionObject.cosmwasm.path}) does not match deprecated proerty (versionObject.cosmwasm_path) value (${versionObject.cosmwasm_path}) for: ${chain_name}::${name}`);
-    }
-  }
-
-  if (versionObject.ics_enabled) {
-    if (!(arraysEqual(versionObject.ics_enabled, versionObject.ibc.ics_enabled))) {
-      throw new Error(`Replacement property (versionObject.ibc.ics_enabled) value (${versionObject.ibc.ics_enabled}) does not match deprecated property (versionObject.ics_enabled) value (${versionObject.ics_enabled}) for: ${chain_name}::${name}`);
-    }
+  if (mismatches.length > 0) {
+    console.log('Found mismatches:');
+    mismatches.forEach((mismatch) =>
+      console.log(
+        `Path: ${mismatch.path}, Reason: ${mismatch.reason}, In "codebase": ${mismatch.value1}, In currentVersion: ${mismatch.value2}`
+      )
+    );
+    throw new Error(`Some version properties in codebase do not match the current version for ${chain_name}.`);
   }
 
 }
+
 
 function checkFileSchemaReference(fileLocation, fileName, extraParentDirectories, schema) {
 
@@ -435,7 +393,7 @@ function checkTypeAsset(chain_name, asset) {
 
 }
 
-export function checkUniqueBaseDenom(chain_name, asset) {
+function checkUniqueBaseDenom(chain_name, asset) {
 
   if (base_denoms.includes(asset.base)) {
     throw new Error(`Base (denom) already registered: ${chain_name}, ${asset.base}, ${asset.symbol}.`);
@@ -443,6 +401,16 @@ export function checkUniqueBaseDenom(chain_name, asset) {
     base_denoms.push(asset.base);
   }
 
+}
+
+function checkChainNameMatchDirectory(chain_name) {
+  chain_reg.files.forEach((file) => {
+    const fileChainNameValue = chain_reg.getFileProperty(chain_name, file, "chain_name");
+    if (!fileChainNameValue) { return; }
+    if (fileChainNameValue !== chain_name) {
+      throw new Error(`Directory ${chain_name}'s ${file} file has chain_name: ${fileChainNameValue}, which is a mismatch!`);
+    }
+  });
 }
 
 
@@ -456,8 +424,14 @@ export function validate_chain_files() {
 
     //console.log(chain_name);
 
+    //check if chain_name matches directory name
+    checkChainNameMatchDirectory(chain_name);
+
     //check if chain_id is registered by another chain
     checkChainIdConflict(chain_name);
+
+    //check for slip44
+    checkSlip44(chain_name);
 
     //check if all fee tokens are registered
     checkFeeTokensAreRegistered(chain_name);
@@ -465,11 +439,8 @@ export function validate_chain_files() {
     //check if all staking tokens are registered
     checkStakingTokensAreRegistered(chain_name);
 
-    //check if all old version properties' data are added into the new replacement version properties
-    checkReplacementVersionProperties(chain_name);
-
-    //check that versions[] cannot be defined in chain.json when versions.json exists
-    checkVersionsFileAndVersionsArray(chain_name);
+    //ensure that and version properties in codebase are also defined in the versions file.
+    compare_CodebaseVersionData_to_VersionsFile(chain_name);
 
     //get chain's assets
     const chainAssets = chain_reg.getFileProperty(chain_name, "assetlist", "assets");
@@ -568,6 +539,9 @@ function checkDuplicateChannels(channel_id, chain, counterparty, chainNameToIbcC
 }
 
 function main() {
+
+  //setup chain registry
+  chain_reg.setup(chainRegistryRoot);
 
   //check all chains
   validate_chain_files();
